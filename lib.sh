@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Shared helpers for install.sh and uninstall.sh. Sourced, not executed.
+# shellcheck disable=SC2034  # variables here are used by the scripts that source this
 
-STAGE_SINK="effect_input.atmos-360"
-PRESETS=(Atmos-Speakers-360 Atmos-Headphones-360)
+STAGE_SINK="effect_input.auralis-360"
+OUTPUT_PRESETS=(Auralis-Speakers Auralis-Headphones)
+INPUT_PRESETS=(Auralis-Mic Auralis-Mic-Off)
 
 BIN_DIR="$HOME/.local/bin"
 PW_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/pipewire/filter-chain.conf.d"
-PW_CONF="$PW_CONF_DIR/sink-atmos-360.conf"
+PW_CONF="$PW_CONF_DIR/sink-auralis-360.conf"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-UNIT="atmos-auto.service"
-AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/easyeffects-atmos.desktop"
-STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/atmos"
+UNIT="auralis-auto.service"
+AUTOSTART="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/easyeffects-auralis.desktop"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/auralis"
 EE_RC="${XDG_CONFIG_HOME:-$HOME/.config}/easyeffects/db/easyeffectsrc"
 EE_GSCHEMA="com.github.wwmm.easyeffects.streamoutputs"
 
@@ -27,11 +29,12 @@ ee_major() {
 }
 
 # EasyEffects 8 (Qt) keeps presets in ~/.local/share, 7 (GTK) in ~/.config.
+# $1 is "output" or "input".
 ee_preset_dir() {
     if [ "$(ee_major)" -ge 8 ] 2>/dev/null; then
-        echo "${XDG_DATA_HOME:-$HOME/.local/share}/easyeffects/output"
+        echo "${XDG_DATA_HOME:-$HOME/.local/share}/easyeffects/$1"
     else
-        echo "${XDG_CONFIG_HOME:-$HOME/.config}/easyeffects/output"
+        echo "${XDG_CONFIG_HOME:-$HOME/.config}/easyeffects/$1"
     fi
 }
 
@@ -59,7 +62,12 @@ ee_start() {
     ee_running && return 0
     # shellcheck disable=SC2046
     setsid nohup easyeffects $(ee_service_args) >/dev/null 2>&1 &
-    sleep 4
+    # ready once its virtual sink exists
+    for _ in $(seq 20); do
+        sink_present easyeffects_sink && break
+        sleep 0.5
+    done
+    sleep 1
 }
 
 # Point EasyEffects' output at a fixed sink ($1), or back at the system
@@ -67,8 +75,9 @@ ee_start() {
 # picks it up live; EasyEffects 8 only reads its config file at startup, so
 # it has to be stopped while the file is edited.
 ee_set_output() {
-    local device="${1:-}"
-    if have gsettings && gsettings list-schemas 2>/dev/null | grep -qx "$EE_GSCHEMA"; then
+    local device="${1:-}" schemas=""
+    have gsettings && schemas="$(gsettings list-schemas 2>/dev/null || true)"
+    if grep -qx "$EE_GSCHEMA" <<<"$schemas"; then
         if [ -n "$device" ]; then
             gsettings set "$EE_GSCHEMA" use-default-output-device false
             gsettings set "$EE_GSCHEMA" output-device "$device"
@@ -111,6 +120,10 @@ find_sofa() {
     { find /usr/share /usr/local/share -maxdepth 3 -name '*.sofa' 2>/dev/null || true; } | head -n1 | grep .
 }
 
-stage_present() {
-    pactl list sinks short 2>/dev/null | grep -q "$STAGE_SINK"
+# Output is captured before matching: with `set -o pipefail`, `cmd | grep -q`
+# can report failure when grep exits early and cmd gets SIGPIPE.
+sink_present() {
+    local sinks
+    sinks="$(pactl list sinks short 2>/dev/null || true)"
+    grep -q "$1" <<<"$sinks"
 }
