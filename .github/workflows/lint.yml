@@ -1,0 +1,17 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck -x install.sh uninstall.sh lib.sh
+      - name: Python syntax
+        run: python3 -m py_compile bin/auralis
+      - name: Presets are valid JSON
+        run: for f in presets/*.json; do python3 -m json.tool "$f" > /dev/null; done
