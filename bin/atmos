@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Auto-configure the Atmos-style EasyEffects setup for the current output.
+
+Audio path:  apps -> EasyEffects -> "Atmos 360" stage -> default hardware sink
+
+The watcher looks at whatever the default hardware output is, decides whether
+it is headphones or speakers, then loads the matching EasyEffects preset and
+switches the Atmos 360 stage between binaural (headphones) and passthrough
+(speakers). Nothing is tied to a specific device.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+STAGE = "effect_input.atmos-360"
+VIRTUAL = (STAGE, "easyeffects_sink")
+MODE_FILE = os.path.expanduser("~/.config/atmos/mode")
+PRESETS = {"headphones": "Atmos-Headphones-360", "speakers": "Atmos-Speakers-360"}
+# mixer gains 1-4 = virtual front/rear speakers (HRTF), 5 = dry passthrough
+GAINS = {"headphones": (1.25, 1.25, 0.6, 0.6, 0.0), "speakers": (0.0, 0.0, 0.0, 0.0, 1.0)}
+HEADPHONE_FORM_FACTORS = ("headphone", "headset", "hands-free")
+
+
+def run(*cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout
+
+
+def sinks():
+    try:
+        return json.loads(run("pactl", "-f", "json", "list", "sinks"))
+    except ValueError:
+        return []
+
+
+def is_hardware(sink):
+    return sink["name"] not in VIRTUAL and sink.get("properties", {}).get("node.virtual") != "true"
+
+
+def hardware_sink():
+    """The default sink, or the best hardware one if the default is virtual."""
+    all_sinks = sinks()
+    default = run("pactl", "get-default-sink").strip()
+    hw = [s for s in all_sinks if is_hardware(s)]
+    for s in hw:
+        if s["name"] == default:
+            return s
+    if not hw:
+        return None
+    # Default points at a virtual sink, which would loop the stage into
+    # itself; hand it back to real hardware.
+    best = max(hw, key=lambda s: s.get("state") == "RUNNING")
+    subprocess.run(["pactl", "set-default-sink", best["name"]])
+    return best
+
+
+def classify(sink):
+    props = sink.get("properties", {})
+    port = sink.get("active_port") or ""
+    port_type = next((p.get("type", "") for p in sink.get("ports", []) if p["name"] == port), "")
+    form = (props.get("device.form-factor") or "").lower()
+    if "headphone" in port.lower() or "headset" in port.lower():
+        return "headphones"
+    if port_type.lower() in ("headphones", "headset"):
+        return "headphones"
+    if form in HEADPHONE_FORM_FACTORS:
+        return "headphones"
+    if sink["name"].startswith("bluez_output") and form not in ("speaker", "portable", "car", "hifi", "tv"):
+        return "headphones"
+    return "speakers"
+
+
+def forced_mode():
+    try:
+        mode = open(MODE_FILE).read().strip()
+    except OSError:
+        return "auto"
+    return mode if mode in PRESETS else "auto"
+
+
+def stage_id():
+    out = run("pw-cli", "ls", "Node")
+    node = None
+    for line in out.splitlines():
+        m = re.match(r"\s*id (\d+),", line)
+        if m:
+            node = m.group(1)
+        elif f'node.name = "{STAGE}"' in line:
+            return node
+    return None
+
+
+def stage_gains(node):
+    out = run("pw-cli", "e", node, "Props")
+    found = dict(re.findall(r'String "(mix[LR]:Gain \d)"\s+Float ([\d.]+)', out))
+    return {k: float(v) for k, v in found.items()}
+
+
+def set_stage(kind):
+    """Returns True if the stage is in the wanted state."""
+    node = stage_id()
+    if node is None:
+        return False
+    want = {f"mix{ch}:Gain {i + 1}": g for ch in "LR" for i, g in enumerate(GAINS[kind])}
+    have = stage_gains(node)
+    if all(abs(have.get(k, -1) - v) < 0.01 for k, v in want.items()):
+        return True
+    params = " ".join(f'"{k}" {v}' for k, v in want.items())
+    run("pw-cli", "s", node, "Props", f"{{ params = [ {params} ] }}")
+    return False  # only sticks while the stage is running; re-checked on the next event
+
+
+def easyeffects_pid():
+    return run("pgrep", "-x", "easyeffects").split()[:1]
+
+
+def load_preset(kind):
+    if easyeffects_pid():
+        subprocess.run(["easyeffects", "-l", PRESETS[kind]], capture_output=True)
+
+
+def current_kind():
+    mode = forced_mode()
+    sink = hardware_sink()
+    if mode != "auto":
+        return mode, sink
+    return (classify(sink) if sink else "speakers"), sink
+
+
+def watch():
+    applied = None  # (kind, easyeffects pid) the preset was last loaded for
+    events = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+    while True:
+        kind, sink = current_kind()
+        key = (kind, tuple(easyeffects_pid()))
+        if key != applied:
+            print(f"{sink['name'] if sink else 'no hardware sink'} -> {kind}", flush=True)
+            load_preset(kind)
+            applied = key
+        set_stage(kind)
+        # wait for something relevant, then let the burst of events settle
+        for line in events.stdout:
+            if re.search(r" on (sink|card|server)(?![-\w])", line):
+                break
+        else:
+            sys.exit("pactl subscribe ended")
+        time.sleep(0.4)
+        os.set_blocking(events.stdout.fileno(), False)
+        try:
+            while events.stdout.read():
+                pass
+        except (BlockingIOError, TypeError):
+            pass
+        os.set_blocking(events.stdout.fileno(), True)
+
+
+def status():
+    kind, sink = current_kind()
+    node = stage_id()
+    gains = stage_gains(node) if node else {}
+    binaural = gains.get("mixL:Gain 1", 0) > 0
+    print(f"mode setting : {forced_mode()}")
+    print(f"output device: {sink['name'] if sink else 'none'} (port: {sink.get('active_port') if sink else '-'})")
+    print(f"detected as  : {kind}")
+    print(f"360 stage    : {'missing' if node is None else 'binaural' if binaural else 'passthrough'}")
+    print("preset       : " + run("easyeffects", "-a", "output").strip())
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd == "watch":
+        watch()
+    elif cmd in ("auto", "speakers", "headphones"):
+        os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
+        with open(MODE_FILE, "w") as f:
+            f.write(cmd + "\n")
+        subprocess.run(["systemctl", "--user", "restart", "atmos-auto.service"])
+        time.sleep(1.5)
+        status()
+    elif cmd == "off":
+        subprocess.run(["easyeffects", "-b", "1"], capture_output=True)
+    elif cmd == "on":
+        subprocess.run(["easyeffects", "-b", "2"], capture_output=True)
+    elif cmd == "status":
+        status()
+    else:
+        sys.exit("usage: atmos {auto|speakers|headphones|off|on|status}")
+
+
+if __name__ == "__main__":
+    main()
