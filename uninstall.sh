@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Disable or remove the Atmos-style setup. Packages (PipeWire, EasyEffects)
+# Disable or remove Auralis. Packages (PipeWire, EasyEffects)
 # are never removed.
 set -euo pipefail
 
@@ -14,8 +14,8 @@ usage() {
 Usage: ./uninstall.sh [options]
 
   (no option)   remove everything this project installed
-  --disable     switch it off but keep the files; ./install.sh --skip-packages
-                turns it back on
+  --disable     switch it off but keep the presets and the auralis command;
+                ./install.sh --skip-packages turns it back on
   -h, --help    show this help
 EOF
 }
@@ -37,26 +37,33 @@ disable() {
         ee_set_output
         if ee_running; then
             info "Bypassing EasyEffects effects"
+            ee --load-preset Auralis-Mic-Off >/dev/null || true
             ee --bypass 1 >/dev/null || true
         fi
     fi
     rm -f "$AUTOSTART"
+
+    # Take the stage down too: left behind, it could be picked as an output
+    # device with nothing keeping it pointed at real hardware.
+    info "Removing the Auralis 360 stage"
+    rm -f "$PW_CONF"
+    systemctl --user try-restart filter-chain.service >/dev/null 2>&1 || true
 }
 
 remove_files() {
     info "Removing installed files"
-    local p preset_dir
-    rm -f "$BIN_DIR/atmos" "$UNIT_DIR/$UNIT" "$PW_CONF"
+    local p
+    rm -f "$BIN_DIR/auralis" "$UNIT_DIR/$UNIT"
     rm -rf "$STATE_DIR"
     if have easyeffects; then
-        preset_dir="$(ee_preset_dir)"
-        for p in "${PRESETS[@]}"; do
-            rm -f "$preset_dir/$p.json"
+        for p in "${OUTPUT_PRESETS[@]}"; do
+            rm -f "$(ee_preset_dir output)/$p.json"
+        done
+        for p in "${INPUT_PRESETS[@]}"; do
+            rm -f "$(ee_preset_dir input)/$p.json"
         done
     fi
     systemctl --user daemon-reload
-    # drops the Atmos 360 sink; the service itself belongs to PipeWire
-    systemctl --user try-restart filter-chain.service >/dev/null 2>&1 || true
 }
 
 disable
