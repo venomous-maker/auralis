@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install PipeWire + EasyEffects and set up the Atmos-style presets, the
-# Atmos 360 stage and the auto-switching watcher for the current user.
+# Install PipeWire + EasyEffects and set up the Auralis presets, the
+# Auralis 360 stage and the auto-switching watcher for the current user.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,6 +10,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_PACKAGES=0
 FILES_ONLY=0
 AUTOSTART_EE=1
+MIC=1
 
 usage() {
     cat <<EOF
@@ -17,6 +18,7 @@ Usage: ./install.sh [options]
 
   --skip-packages   don't install packages (PipeWire, EasyEffects, plugins)
   --no-autostart    don't start EasyEffects automatically at login
+  --no-mic          don't turn on microphone noise suppression
   --files-only      only copy files; don't touch services or EasyEffects
   -h, --help        show this help
 
@@ -28,6 +30,7 @@ for arg in "$@"; do
     case "$arg" in
         --skip-packages) SKIP_PACKAGES=1 ;;
         --no-autostart)  AUTOSTART_EE=0 ;;
+        --no-mic)        MIC=0 ;;
         --files-only)    FILES_ONLY=1; SKIP_PACKAGES=1 ;;
         -h|--help)       usage; exit 0 ;;
         *)               usage >&2; exit 1 ;;
@@ -64,33 +67,48 @@ check_requirements() {
     for cmd in pipewire pactl pw-cli easyeffects python3 systemctl; do
         have "$cmd" || missing+=("$cmd")
     done
-    [ ${#missing[@]} -eq 0 ] || die "missing commands: ${missing[*]}"
+    if [ ${#missing[@]} -ne 0 ]; then
+        [[ " ${missing[*]} " != *" easyeffects "* ]] || ! have flatpak \
+            || warn "a Flatpak EasyEffects does not count; this setup needs the distribution package"
+        die "missing commands: ${missing[*]}"
+    fi
 
     if ! { find /usr/lib /usr/lib64 /usr/local/lib -name 'libspa-filter-graph-plugin-sofa.so' 2>/dev/null || true; } | grep -q .; then
         warn "PipeWire's SOFA spatializer plugin was not found; headphone 360 mode needs PipeWire 1.4+ built with libmysofa"
     fi
-    if flatpak list 2>/dev/null | grep -q com.github.wwmm.easyeffects && ! have easyeffects; then
-        die "only the Flatpak EasyEffects was found; this setup needs the distribution package"
+
+    local pw_version
+    pw_version="$(pipewire --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | tail -n1 || true)"
+    case "$pw_version" in
+        0.*|1.0|1.1|1.2|1.3) warn "PipeWire $pw_version is older than 1.4; the Auralis 360 stage may not load" ;;
+    esac
+    if [ "$(ee_major)" -lt 8 ] 2>/dev/null; then
+        warn "EasyEffects $(ee_major) found; the speaker preset's Crosstalk Canceller needs EasyEffects 8 and will be skipped"
     fi
+    pactl -f json info >/dev/null 2>&1 \
+        || die "pactl does not support JSON output (needs pulseaudio-utils 16 or newer)"
+    systemctl --user cat filter-chain.service >/dev/null 2>&1 \
+        || die "PipeWire's filter-chain.service was not found; your PipeWire package does not ship it"
 }
 
 install_files() {
-    local sofa preset_dir
+    local sofa p
     sofa="$(find_sofa)" || die "no .sofa HRTF file found (normally shipped by libmysofa in /usr/share/libmysofa)"
-    preset_dir="$(ee_preset_dir)"
 
-    info "Installing the atmos command to $BIN_DIR"
-    install -Dm755 "$REPO/bin/atmos" "$BIN_DIR/atmos"
+    info "Installing the auralis command to $BIN_DIR"
+    install -Dm755 "$REPO/bin/auralis" "$BIN_DIR/auralis"
 
-    info "Installing EasyEffects presets to $preset_dir"
-    local p
-    for p in "${PRESETS[@]}"; do
-        install -Dm644 "$REPO/presets/$p.json" "$preset_dir/$p.json"
+    info "Installing EasyEffects presets to $(dirname "$(ee_preset_dir output)")"
+    for p in "${OUTPUT_PRESETS[@]}"; do
+        install -Dm644 "$REPO/presets/$p.json" "$(ee_preset_dir output)/$p.json"
+    done
+    for p in "${INPUT_PRESETS[@]}"; do
+        install -Dm644 "$REPO/presets/$p.json" "$(ee_preset_dir input)/$p.json"
     done
 
-    info "Installing the Atmos 360 stage (HRTF: $sofa)"
+    info "Installing the Auralis 360 stage (HRTF: $sofa)"
     mkdir -p "$PW_CONF_DIR"
-    sed "s|@SOFA_FILE@|$sofa|g" "$REPO/config/pipewire/sink-atmos-360.conf" > "$PW_CONF"
+    sed "s|@SOFA_FILE@|$sofa|g" "$REPO/config/pipewire/sink-auralis-360.conf" > "$PW_CONF"
 
     info "Installing the auto-switch service"
     install -Dm644 "$REPO/config/systemd/$UNIT" "$UNIT_DIR/$UNIT"
@@ -102,8 +120,8 @@ install_autostart() {
     cat > "$AUTOSTART" <<EOF
 [Desktop Entry]
 Type=Application
-Name=EasyEffects (Atmos)
-Comment=Start EasyEffects in the background for the Atmos-style setup
+Name=EasyEffects (Auralis)
+Comment=Start EasyEffects in the background for Auralis
 Exec=easyeffects $(ee_service_args)
 Icon=com.github.wwmm.easyeffects
 X-GNOME-Autostart-enabled=true
@@ -115,19 +133,24 @@ activate() {
     systemctl --user enable --now pipewire.service pipewire-pulse.service wireplumber.service >/dev/null 2>&1 \
         || warn "could not enable the PipeWire user services; if you still run PulseAudio, switch to PipeWire and log in again"
 
-    info "Starting the Atmos 360 stage"
+    info "Starting the Auralis 360 stage"
     systemctl --user enable filter-chain.service >/dev/null 2>&1 || true
     systemctl --user restart filter-chain.service
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        stage_present && break
+    for _ in $(seq 10); do
+        sink_present "$STAGE_SINK" && break
         sleep 1
     done
-    stage_present || die "the Atmos 360 sink did not appear; check: journalctl --user -u filter-chain"
+    sink_present "$STAGE_SINK" || die "the Auralis 360 sink did not appear; check: journalctl --user -u filter-chain"
 
     info "Routing EasyEffects through the stage"
     ee_set_output "$STAGE_SINK"
     ee_start
     ee --bypass 2 >/dev/null || true
+
+    if [ "$MIC" = 1 ]; then
+        info "Enabling microphone noise suppression"
+        ee --load-preset Auralis-Mic >/dev/null || warn "could not load the microphone preset"
+    fi
 
     info "Starting the auto-switch service"
     systemctl --user enable "$UNIT" >/dev/null 2>&1
@@ -148,8 +171,8 @@ fi
 activate
 
 info "Done. Current state:"
-"$BIN_DIR/atmos" status || true
+"$BIN_DIR/auralis" status || true
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
-    *) warn "$BIN_DIR is not in your PATH; add it to use the 'atmos' command directly" ;;
+    *) warn "$BIN_DIR is not in your PATH; add it to use the 'auralis' command directly" ;;
 esac
