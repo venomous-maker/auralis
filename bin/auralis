@@ -1,31 +1,38 @@
 #!/usr/bin/env python3
-"""Auto-configure the Atmos-style EasyEffects setup for the current output.
+"""Auto-configure the Auralis EasyEffects setup for the current output.
 
-Audio path:  apps -> EasyEffects -> "Atmos 360" stage -> default hardware sink
+Audio path:  apps -> EasyEffects -> "Auralis 360" stage -> default hardware sink
 
 The watcher looks at whatever the default hardware output is, decides whether
 it is headphones or speakers, then loads the matching EasyEffects preset and
-switches the Atmos 360 stage between binaural (headphones) and passthrough
+switches the Auralis 360 stage between binaural (headphones) and passthrough
 (speakers). Nothing is tied to a specific device.
 """
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
 
-STAGE = "effect_input.atmos-360"
+STAGE = "effect_input.auralis-360"
 VIRTUAL = (STAGE, "easyeffects_sink")
-MODE_FILE = os.path.expanduser("~/.config/atmos/mode")
-PRESETS = {"headphones": "Atmos-Headphones-360", "speakers": "Atmos-Speakers-360"}
+MODE_FILE = os.path.expanduser("~/.config/auralis/mode")
+SERVICE = "auralis-auto.service"
+PRESETS = {"headphones": "Auralis-Headphones", "speakers": "Auralis-Speakers"}
+MIC_PRESETS = {"on": "Auralis-Mic", "off": "Auralis-Mic-Off"}
 # mixer gains 1-4 = virtual front/rear speakers (HRTF), 5 = dry passthrough
 GAINS = {"headphones": (1.25, 1.25, 0.6, 0.6, 0.0), "speakers": (0.0, 0.0, 0.0, 0.0, 1.0)}
 HEADPHONE_FORM_FACTORS = ("headphone", "headset", "hands-free")
+EVENT = re.compile(rb" on (sink|card|server)(?![-\w])")
 
 
-def run(*cmd):
-    return subprocess.run(cmd, capture_output=True, text=True).stdout
+def run(*cmd, timeout=10):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
 
 
 def sinks():
@@ -39,7 +46,7 @@ def is_hardware(sink):
     return sink["name"] not in VIRTUAL and sink.get("properties", {}).get("node.virtual") != "true"
 
 
-def hardware_sink():
+def hardware_sink(fix_default=False):
     """The default sink, or the best hardware one if the default is virtual."""
     all_sinks = sinks()
     default = run("pactl", "get-default-sink").strip()
@@ -49,10 +56,11 @@ def hardware_sink():
             return s
     if not hw:
         return None
-    # Default points at a virtual sink, which would loop the stage into
-    # itself; hand it back to real hardware.
     best = max(hw, key=lambda s: s.get("state") == "RUNNING")
-    subprocess.run(["pactl", "set-default-sink", best["name"]])
+    if fix_default:
+        # Default points at a virtual sink, which would loop the stage into
+        # itself; hand it back to real hardware.
+        run("pactl", "set-default-sink", best["name"])
     return best
 
 
@@ -99,61 +107,79 @@ def stage_gains(node):
 
 
 def set_stage(kind):
-    """Returns True if the stage is in the wanted state."""
     node = stage_id()
     if node is None:
-        return False
+        return
     want = {f"mix{ch}:Gain {i + 1}": g for ch in "LR" for i, g in enumerate(GAINS[kind])}
     have = stage_gains(node)
     if all(abs(have.get(k, -1) - v) < 0.01 for k, v in want.items()):
-        return True
+        return
+    # Only sticks while the stage is running; it is re-checked on the next
+    # event, and the stage starting to play is itself an event.
     params = " ".join(f'"{k}" {v}' for k, v in want.items())
     run("pw-cli", "s", node, "Props", f"{{ params = [ {params} ] }}")
-    return False  # only sticks while the stage is running; re-checked on the next event
 
 
 def easyeffects_pid():
-    return run("pgrep", "-x", "easyeffects").split()[:1]
+    return tuple(run("pgrep", "-x", "easyeffects").split()[:1])
 
 
-def load_preset(kind):
-    if easyeffects_pid():
-        subprocess.run(["easyeffects", "-l", PRESETS[kind]], capture_output=True)
+def easyeffects(*args):
+    """Talk to the running EasyEffects. Returns its output, or None if it is
+    not running or did not answer (it can be slow right after starting)."""
+    if not easyeffects_pid():
+        return None
+    try:
+        res = subprocess.run(("easyeffects",) + args, capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return res.stdout if res.returncode == 0 else None
 
 
-def current_kind():
+def current_kind(fix_default=False):
     mode = forced_mode()
-    sink = hardware_sink()
+    sink = hardware_sink(fix_default)
     if mode != "auto":
         return mode, sink
     return (classify(sink) if sink else "speakers"), sink
 
 
+def wait_for_event(fd, timeout):
+    """Block until pactl reports a sink/card/default change, then let the
+    burst settle. Returns early after `timeout` seconds if given."""
+    while True:
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            return
+        data = os.read(fd, 65536)
+        if not data:
+            sys.exit("pactl subscribe ended (audio server gone)")
+        if EVENT.search(data):
+            break
+    time.sleep(0.4)
+    while select.select([fd], [], [], 0)[0]:
+        if not os.read(fd, 65536):
+            sys.exit("pactl subscribe ended (audio server gone)")
+
+
 def watch():
     applied = None  # (kind, easyeffects pid) the preset was last loaded for
-    events = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+    events = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE)
+    fd = events.stdout.fileno()
     while True:
-        kind, sink = current_kind()
-        key = (kind, tuple(easyeffects_pid()))
-        if key != applied:
-            print(f"{sink['name'] if sink else 'no hardware sink'} -> {kind}", flush=True)
-            load_preset(kind)
-            applied = key
+        kind, sink = current_kind(fix_default=True)
+        pid = easyeffects_pid()
+        retry = None
+        if (kind, pid) != applied:
+            if not pid:
+                applied = (kind, pid)  # nothing to load into; its sink appearing wakes us
+            elif easyeffects("-l", PRESETS[kind]) is not None:
+                print(f"{sink['name'] if sink else 'no hardware sink'} -> {kind}", flush=True)
+                applied = (kind, pid)
+            else:
+                retry = 3  # EasyEffects not answering yet
         set_stage(kind)
-        # wait for something relevant, then let the burst of events settle
-        for line in events.stdout:
-            if re.search(r" on (sink|card|server)(?![-\w])", line):
-                break
-        else:
-            sys.exit("pactl subscribe ended")
-        time.sleep(0.4)
-        os.set_blocking(events.stdout.fileno(), False)
-        try:
-            while events.stdout.read():
-                pass
-        except (BlockingIOError, TypeError):
-            pass
-        os.set_blocking(events.stdout.fileno(), True)
+        wait_for_event(fd, retry)
 
 
 def status():
@@ -161,32 +187,44 @@ def status():
     node = stage_id()
     gains = stage_gains(node) if node else {}
     binaural = gains.get("mixL:Gain 1", 0) > 0
+    presets = easyeffects("-s")
     print(f"mode setting : {forced_mode()}")
     print(f"output device: {sink['name'] if sink else 'none'} (port: {sink.get('active_port') if sink else '-'})")
     print(f"detected as  : {kind}")
     print(f"360 stage    : {'missing' if node is None else 'binaural' if binaural else 'passthrough'}")
-    print("preset       : " + run("easyeffects", "-a", "output").strip())
+    if presets is None:
+        print("easyeffects  : not running")
+        return
+    loaded = dict(re.findall(r"(input|output):[ \t]*(\S*)", presets))
+    print(f"preset       : {loaded.get('output') or '-'}")
+    print(f"mic preset   : {loaded.get('input') or '-'}")
+
+
+USAGE = "usage: auralis {status|auto|speakers|headphones|mic on|mic off|on|off}"
 
 
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    args = sys.argv[1:] or ["status"]
+    cmd = args[0]
     if cmd == "watch":
         watch()
     elif cmd in ("auto", "speakers", "headphones"):
         os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
         with open(MODE_FILE, "w") as f:
             f.write(cmd + "\n")
-        subprocess.run(["systemctl", "--user", "restart", "atmos-auto.service"])
+        subprocess.run(["systemctl", "--user", "restart", SERVICE])
         time.sleep(1.5)
         status()
-    elif cmd == "off":
-        subprocess.run(["easyeffects", "-b", "1"], capture_output=True)
-    elif cmd == "on":
-        subprocess.run(["easyeffects", "-b", "2"], capture_output=True)
+    elif cmd == "mic" and len(args) == 2 and args[1] in MIC_PRESETS:
+        if easyeffects("-l", MIC_PRESETS[args[1]]) is None:
+            sys.exit("EasyEffects is not running")
+    elif cmd in ("off", "on"):
+        if easyeffects("-b", "1" if cmd == "off" else "2") is None:
+            sys.exit("EasyEffects is not running")
     elif cmd == "status":
         status()
     else:
-        sys.exit("usage: atmos {auto|speakers|headphones|off|on|status}")
+        sys.exit(USAGE)
 
 
 if __name__ == "__main__":
