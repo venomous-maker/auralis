@@ -310,7 +310,7 @@
             "bypass": false,
             "input-gain": 0.0,
             "output-gain": 0.0,
-            "delay-us": 120.0,
+            "delay-us": 220.0,
             "decay-db": -3.0,
             "phantom-center-only": false
         }
