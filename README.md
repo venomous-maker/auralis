@@ -29,7 +29,8 @@ renders through an HRTF (the MIT KEMAR dummy-head measurements shipped with
 libmysofa); in speaker mode it passes audio through untouched. It follows the
 system's default output, so no device is hardcoded.
 
-The **`auralis-auto` service** watches the default output device. When it
+The **`auralis-auto` service** starts with your desktop session and watches
+the default output device. When it
 changes (you plug in headphones, connect a Bluetooth headset, switch to HDMI)
 it loads the matching preset and flips the stage between binaural and
 passthrough.
@@ -168,6 +169,9 @@ journalctl --user -u filter-chain -n 20    # Auralis 360 stage
 - **No sound after install** — check that the system's output device is your
   real hardware, not "Auralis 360" or "Easy Effects Sink". The watcher corrects
   this by itself when it is running.
+- **EasyEffects crash reports at login** — versions before the service was
+  tied to the graphical session started the watcher too early. Update and
+  re-run the installer: `git pull && ./install.sh --skip-packages`.
 - **Nothing is applied after login** — EasyEffects must be running; re-run
   `./install.sh --skip-packages` without `--no-autostart`.
 - **Others can't hear noise suppression working** — the calling app must use
