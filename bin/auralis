@@ -170,6 +170,7 @@ def watch():
     applied = None  # (kind, easyeffects pid) the preset was last loaded for
     events = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE)
     fd = events.stdout.fileno()
+    failures = 0
     while True:
         kind, sink = current_kind(fix_default=True)
         pid = easyeffects_pid()
@@ -180,8 +181,12 @@ def watch():
             elif easyeffects("-l", PRESETS[kind]) is not None:
                 print(f"{sink['name'] if sink else 'no hardware sink'} -> {kind}", flush=True)
                 applied = (kind, pid)
+                failures = 0
             else:
-                retry = 3  # EasyEffects not answering yet
+                # EasyEffects not answering yet; back off instead of hammering it
+                failures += 1
+                retry = min(60, 3 * 2 ** (failures - 1))
+                print(f"EasyEffects did not accept the preset; retrying in {retry}s", flush=True)
         set_stage(kind)
         wait_for_event(fd, retry)
 
