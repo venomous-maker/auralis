@@ -129,8 +129,12 @@ def easyeffects(*args):
     not running or did not answer (it can be slow right after starting)."""
     if not easyeffects_pid():
         return None
+    # This is only a client forwarding a command to the running instance, so
+    # it needs no display. Without this Qt aborts when the watcher was started
+    # at boot, before the desktop session exported DISPLAY/WAYLAND_DISPLAY.
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     try:
-        res = subprocess.run(("easyeffects",) + args, capture_output=True, text=True, timeout=15)
+        res = subprocess.run(("easyeffects",) + args, capture_output=True, text=True, timeout=15, env=env)
     except (subprocess.TimeoutExpired, OSError):
         return None
     return res.stdout if res.returncode == 0 else None
