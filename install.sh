@@ -153,7 +153,14 @@ activate() {
     fi
 
     info "Starting the auto-switch service"
-    systemctl --user enable "$UNIT" >/dev/null 2>&1
+    # reenable: an older install may have hooked it to a different target
+    systemctl --user reenable "$UNIT" >/dev/null 2>&1
+    if ! systemctl --user is-active --quiet graphical-session.target; then
+        # Window managers that never reach graphical-session.target would
+        # otherwise not start the service at all.
+        warn "graphical-session.target is not active on this desktop; starting the service at login instead"
+        systemctl --user add-wants default.target "$UNIT" >/dev/null 2>&1 || true
+    fi
     systemctl --user restart "$UNIT"
     sleep 3
 }
