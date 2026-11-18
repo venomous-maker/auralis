@@ -3,7 +3,7 @@
 # shellcheck disable=SC2034  # variables here are used by the scripts that source this
 
 STAGE_SINK="effect_input.auralis-360"
-OUTPUT_PRESETS=(Auralis-Speakers Auralis-Headphones)
+OUTPUT_PRESETS=(Auralis-Speakers Auralis-Headphones Auralis-Speakers-Theatre Auralis-Headphones-Theatre)
 INPUT_PRESETS=(Auralis-Mic Auralis-Mic-Off)
 
 BIN_DIR="$HOME/.local/bin"
