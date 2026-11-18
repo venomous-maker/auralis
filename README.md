@@ -35,6 +35,14 @@ changes (you plug in headphones, connect a Bluetooth headset, switch to HDMI)
 it loads the matching preset and flips the stage between binaural and
 passthrough.
 
+**Theatre profile** is an optional sound you switch on when watching films.
+It uses a cinema curve (deeper sub-bass, a dialogue lift around 2.5 kHz,
+a softer top for long sessions), stronger bass enhancement and a faint
+large-hall ambience. On headphones the 360 stage also moves the surround
+speakers further back and makes them louder. Device detection keeps working:
+theatre follows you between speakers and headphones until you switch back to
+`music`.
+
 **Microphone noise suppression** runs on the input side: a high-pass filter,
 RNNoise (a neural noise remover) and a limiter. It removes steady background
 noise such as fans, hum and keyboard clatter from what others hear. Apps pick
@@ -88,6 +96,8 @@ auralis status       # what was detected and what is applied
 auralis auto         # detect the output automatically (default)
 auralis headphones   # force headphone mode
 auralis speakers     # force speaker mode
+auralis theatre      # cinema sound for films ("theater" works too)
+auralis music        # back to the everyday sound (default)
 auralis mic on       # microphone noise suppression on (default)
 auralis mic off      # microphone noise suppression off
 auralis off          # bypass all effects
@@ -99,6 +109,13 @@ auralis on           # turn effects back on
 Headphones plugged into a **monitor's** audio jack look like plain HDMI to the
 system, so they are treated as speakers. Run `auralis headphones` for that
 case, and `auralis auto` to hand control back.
+
+### Picking a preset in EasyEffects
+
+All four presets also appear under **Presets** in EasyEffects, so you can
+load one by hand. The watcher replaces it with the matching preset the next
+time the output device changes; use `auralis theatre` / `auralis music` for a
+choice that sticks.
 
 ### Tuning
 
@@ -139,10 +156,11 @@ EasyEffects themselves are never removed.
 | `~/.local/bin/auralis` | Control command and watcher |
 | `~/.config/systemd/user/auralis-auto.service` | Runs the watcher |
 | `~/.config/pipewire/filter-chain.conf.d/sink-auralis-360.conf` | The Auralis 360 stage |
-| `~/.local/share/easyeffects/output/Auralis-*.json` | Speaker and headphone presets |
+| `~/.local/share/easyeffects/output/Auralis-*.json` | Speaker and headphone presets, music and theatre |
 | `~/.local/share/easyeffects/input/Auralis-Mic*.json` | Microphone presets |
 | `~/.config/autostart/easyeffects-auralis.desktop` | Starts EasyEffects at login |
 | `~/.config/auralis/mode` | Your `auto` / `headphones` / `speakers` choice |
+| `~/.config/auralis/profile` | Your `music` / `theatre` choice |
 
 On EasyEffects 7 the presets go to `~/.config/easyeffects/` instead.
 
