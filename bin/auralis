@@ -19,11 +19,21 @@ import time
 STAGE = "effect_input.auralis-360"
 VIRTUAL = (STAGE, "easyeffects_sink")
 MODE_FILE = os.path.expanduser("~/.config/auralis/mode")
+PROFILE_FILE = os.path.expanduser("~/.config/auralis/profile")
 SERVICE = "auralis-auto.service"
-PRESETS = {"headphones": "Auralis-Headphones", "speakers": "Auralis-Speakers"}
+KINDS = ("headphones", "speakers")
+PROFILES = ("music", "theatre")
+PRESETS = {
+    ("headphones", "music"): "Auralis-Headphones",
+    ("speakers", "music"): "Auralis-Speakers",
+    ("headphones", "theatre"): "Auralis-Headphones-Theatre",
+    ("speakers", "theatre"): "Auralis-Speakers-Theatre",
+}
 MIC_PRESETS = {"on": "Auralis-Mic", "off": "Auralis-Mic-Off"}
-# mixer gains 1-4 = virtual front/rear speakers (HRTF), 5 = dry passthrough
-GAINS = {"headphones": (1.25, 1.25, 0.6, 0.6, 0.0), "speakers": (0.0, 0.0, 0.0, 0.0, 1.0)}
+# Stage controls. Mixer gains 1-4 = virtual front/rear speakers (HRTF),
+# 5 = dry passthrough; the delay sets how far behind the surrounds sit.
+BINAURAL = {"music": (1.25, 1.25, 0.6, 0.6, 0.0, 0.012), "theatre": (1.1, 1.1, 0.85, 0.85, 0.0, 0.022)}
+PASSTHROUGH = (0.0, 0.0, 0.0, 0.0, 1.0, 0.012)
 HEADPHONE_FORM_FACTORS = ("headphone", "headset", "hands-free")
 EVENT = re.compile(rb" on (sink|card|server)(?![-\w])")
 
@@ -85,7 +95,15 @@ def forced_mode():
         mode = open(MODE_FILE).read().strip()
     except OSError:
         return "auto"
-    return mode if mode in PRESETS else "auto"
+    return mode if mode in KINDS else "auto"
+
+
+def profile():
+    try:
+        name = open(PROFILE_FILE).read().strip()
+    except OSError:
+        return "music"
+    return name if name in PROFILES else "music"
 
 
 def stage_id():
@@ -102,15 +120,17 @@ def stage_id():
 
 def stage_gains(node):
     out = run("pw-cli", "e", node, "Props")
-    found = dict(re.findall(r'String "(mix[LR]:Gain \d)"\s+Float ([\d.]+)', out))
+    found = dict(re.findall(r'String "((?:mix[LR]:Gain \d)|(?:del[LR]:Delay \(s\)))"\s+Float ([\d.]+)', out))
     return {k: float(v) for k, v in found.items()}
 
 
-def set_stage(kind):
+def set_stage(kind, prof):
     node = stage_id()
     if node is None:
         return
-    want = {f"mix{ch}:Gain {i + 1}": g for ch in "LR" for i, g in enumerate(GAINS[kind])}
+    *gains, delay = BINAURAL[prof] if kind == "headphones" else PASSTHROUGH
+    want = {f"mix{ch}:Gain {i + 1}": g for ch in "LR" for i, g in enumerate(gains)}
+    want.update({f"del{ch}:Delay (s)": delay for ch in "LR"})
     have = stage_gains(node)
     if all(abs(have.get(k, -1) - v) < 0.01 for k, v in want.items()):
         return
@@ -167,27 +187,28 @@ def wait_for_event(fd, timeout):
 
 
 def watch():
-    applied = None  # (kind, easyeffects pid) the preset was last loaded for
+    applied = None  # (kind, profile, easyeffects pid) the preset was last loaded for
     events = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE)
     fd = events.stdout.fileno()
     failures = 0
     while True:
         kind, sink = current_kind(fix_default=True)
+        prof = profile()
         pid = easyeffects_pid()
         retry = None
-        if (kind, pid) != applied:
+        if (kind, prof, pid) != applied:
             if not pid:
-                applied = (kind, pid)  # nothing to load into; its sink appearing wakes us
-            elif easyeffects("-l", PRESETS[kind]) is not None:
-                print(f"{sink['name'] if sink else 'no hardware sink'} -> {kind}", flush=True)
-                applied = (kind, pid)
+                applied = (kind, prof, pid)  # nothing to load into; its sink appearing wakes us
+            elif easyeffects("-l", PRESETS[kind, prof]) is not None:
+                print(f"{sink['name'] if sink else 'no hardware sink'} -> {kind} ({prof})", flush=True)
+                applied = (kind, prof, pid)
                 failures = 0
             else:
                 # EasyEffects not answering yet; back off instead of hammering it
                 failures += 1
                 retry = min(60, 3 * 2 ** (failures - 1))
                 print(f"EasyEffects did not accept the preset; retrying in {retry}s", flush=True)
-        set_stage(kind)
+        set_stage(kind, prof)
         wait_for_event(fd, retry)
 
 
@@ -198,6 +219,7 @@ def status():
     binaural = gains.get("mixL:Gain 1", 0) > 0
     presets = easyeffects("-s")
     print(f"mode setting : {forced_mode()}")
+    print(f"profile      : {profile()}")
     print(f"output device: {sink['name'] if sink else 'none'} (port: {sink.get('active_port') if sink else '-'})")
     print(f"detected as  : {kind}")
     print(f"360 stage    : {'missing' if node is None else 'binaural' if binaural else 'passthrough'}")
@@ -209,7 +231,16 @@ def status():
     print(f"mic preset   : {loaded.get('input') or '-'}")
 
 
-USAGE = "usage: auralis {status|auto|speakers|headphones|mic on|mic off|on|off}"
+USAGE = "usage: auralis {status|auto|speakers|headphones|music|theatre|mic on|mic off|on|off}"
+
+
+def save_and_restart(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(value + "\n")
+    subprocess.run(["systemctl", "--user", "restart", SERVICE])
+    time.sleep(1.5)
+    status()
 
 
 def main():
@@ -217,13 +248,10 @@ def main():
     cmd = args[0]
     if cmd == "watch":
         watch()
-    elif cmd in ("auto", "speakers", "headphones"):
-        os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
-        with open(MODE_FILE, "w") as f:
-            f.write(cmd + "\n")
-        subprocess.run(["systemctl", "--user", "restart", SERVICE])
-        time.sleep(1.5)
-        status()
+    elif cmd in ("auto",) + KINDS:
+        save_and_restart(MODE_FILE, cmd)
+    elif cmd in PROFILES or cmd == "theater":
+        save_and_restart(PROFILE_FILE, "theatre" if cmd == "theater" else cmd)
     elif cmd == "mic" and len(args) == 2 and args[1] in MIC_PRESETS:
         if easyeffects("-l", MIC_PRESETS[args[1]]) is None:
             sys.exit("EasyEffects is not running")
